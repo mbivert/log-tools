@@ -1,0 +1,14 @@
+#!/bin/sh
+
+set -e
+
+fn=`mktemp /tmp/test.XXXXXX`
+echo '[]' > $fn
+
+$analogtweak --openbsd-httpd-fw -f /dev/null </dev/stdin | $analogtag -r $fn
+x=$?
+
+rm $fn;exit $x
+
+
+

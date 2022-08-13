@@ -1,0 +1,22 @@
+[
+	{
+		"exprs" : {
+			"agent" : "curl-sugar-tests"
+		},
+		"tags"  : ["sugar:tests"]
+	},
+	{
+		"exprs" : {
+			"path"   : ".*",
+			"status" : "^[45]"
+		},
+		"tags"   : ["hack:fail"]
+	},
+	{
+		"exprs" : {
+			"path"   : ".*",
+			"status" : "^[123]"
+		},
+		"tags"   : ["hack:success"]
+	}
+]

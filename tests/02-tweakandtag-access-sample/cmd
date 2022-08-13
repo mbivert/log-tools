@@ -1,0 +1,31 @@
+#!/bin/sh
+
+set -e
+
+d=`dirname $0`
+
+ipl=$d/../../ip2location.csv
+
+if [ ! -f "$ipl" ]; then
+	cat <<EOF >&2
+This test require an ip2location.csv file for IP geolocalisation,
+which cannot be distributed because of a license issue.
+
+You can acquire one by registering a free account on
+
+	https://lite.ip2location.com/database/ip-country
+
+The file must be installed at the root of the .git directory,
+and named 'ip2location.csv'.
+
+If you already have an account with a key, the Makefile
+comes with a rule to automatically perform the installation:
+
+  % make get-ip2location key=...
+EOF
+fi
+
+exec logtweak -openbsd-httpd-fw -ipdb $ipl </dev/stdin | \
+	logtag \
+		-rules $d/rules.json -openbsd-httpd-fw
+#		-cols "domain,date,ts,method,path,status,version,country,ip,values,agent"

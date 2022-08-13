@@ -1,0 +1,690 @@
+#!/usr/bin/perl
+
+# XXX/TODO: do we remove:
+#	meltfields()
+#	joinfields()
+#
+# meltips() and filterdates() are still nice addition
+# for tests.
+
+# analogtweak(1) is a small program to tweak a columnized input file,
+# generally a log file, only relying on rather standard perl(1)
+# modules.
+#
+# Either the input has been prepared by a tool like qsplit(1),
+# and fields have already been identified, or a regexp can be
+# specified capture the fields.
+#
+# An argument naming the expected input columns must be
+# provided. Column names are coma separated, and thus,
+# can *NOT* contain comas.
+#
+# From there, it parses its input line by line, skipping lines that
+# have been specified as skippable, and, for each other line,
+# load it in a hash indexed by the columns names.
+#
+# Additional arguments allow to create new named columns by
+# melting or joining existing ones, parsing them as dates or
+# geolocalizing IPs addresses.
+#
+# The resulting columns can be selectively printed through a
+# list of output columns, specified by an other mandatory argument.
+#
+# While the code should help parse a wide range of ad-hoc
+# columnized log formats, some options are provided to parse
+# specific log files. One key reason is to  automatically test
+# such options more easily.
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Scalar::Util;
+use Time::Piece;
+
+use POSIX;
+
+# Convert a date in a YYYY-MM-DD HH:MM:SS format to a timestamp
+# in local timezone.
+#
+# Input:
+#	$x : YYYY-MM-DD HH:MM:SS
+# Output:
+#	Timestamp in local timezone.
+sub date2ts {
+	my ($d, $f) = @_;
+
+	$f //= "%Y-%m-%d %H:%M:%S";
+
+	my $gm = undef;
+
+	# Some magic to parse those:
+	#	- %f doesn't exists: Time::Piece can't parse milliseconds;
+	#	strip useless data to avoid warning
+	#	- in the only practical case, the date is provided with a
+	#	null tzoffset (gmtime then)
+	if ($f eq '%Y-%m-%dT%H:%M:%S.%fZ') {
+		$d = substr($d, 0, -4);
+		$f = substr($f, 0, -3);
+		$gm = 1;
+	}
+
+	# TODO error management
+	my $x = eval {
+		($gm ? Time::Piece::gmtime : Time::Piece::localtime)
+		->strptime($d, $f)->strftime("%s");
+	};
+	if ($@) {
+		# NOTE: $@ isn't more explicit, e.g.
+		#	Error parsing time at /usr/lib/perl5/5.36/core_perl/Time/Piece.pm:598.
+		return [undef, "cannot parse '$d' as '$f'"];
+	}
+
+	return [$x, undef];
+
+	# Previously:
+#	my ($Y, $M, $D, $h, $m, $s) = split(/[- :]/, $d);
+#	return POSIX::strftime("%s",
+#		$s, $m, $h, $D, $M-1, $Y-1900,
+#	);
+}
+
+sub regcomp {
+	my ($x) = @_;
+
+	my $y = eval {
+		use warnings FATAL => qw(regexp);
+		qr($x);
+	};
+
+	return $@ ? [undef, "cannot compile '$x': $@"] : [$y, undef];
+}
+
+# NOTE: originally, qsplit(1) was mandatory, thus the need for
+# joinfields()/meltfields(). One goal was precisely to avoid
+# such tricky strings.
+#
+# As far as httpd(8) logs are concerned, regex allows to manage
+# user-agent based quote injections.
+#
+# Both regex are automatically tested. Hopefully, they'll hold.
+sub httpdfwre {
+	return qr/^([^ ]+) ([^ ]+) ([^ ]+) ([^ ]+) \[([^\]]+)\] "([^ ]+) (?:(\/[^ \?]*)(\?[^ ]*)? ([^"]+))?" ([0-9]+) ([0-9]+) "([^"]*)" "(.*)" (-|[0-9\.]+) (-|[0-9]+)$/;
+}
+
+# TODO: we should be able to detect bruteforce attempts, but
+# we could embed more input to help; unfortunately, this is
+# likely to required named capture, thus making the regexp
+# even greater.
+#
+# Bruteforce detection should be good enough anyway.
+#
+# NOTE: mind the final |()(): we basically allow all lines
+# starting with a valid date.
+sub authlogre {
+	return qr/(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}.[0-9]+Z) [^ ]+ sshd\[[0-9]+\]: (?|Accepted publickey for ([^ ]+) from ([0-9][^ ]+)|Received disconnect from ()([0-9][^ ]+)|User ([^ ]+)() not allowed|error: kex_exchange_identification:()()|Connection closed by ()([0-9][^ ]+)|Connection closed by invalid user ([^ ]+) ([0-9][^ ]+)|Connection closed by authenticating user ([^ ]+) ([0-9][^ ]+)|banner exchange: Connection from ()([0-9][^ ]+)|()()) /;
+}
+
+# Parse options from ARGV, and create a state (hashref)
+# representing the application.
+#
+# TODO: have this return an array of error instead of a single
+# error.
+#
+# Input:
+#	$argv : arrayref, generally pointing to @ARGV or similar
+# Output:
+#	hashref representing application state
+sub parseopts {
+	my ($argv) = @_;
+
+	# Application states (globals; ease testing)
+	my $S = {
+		'ifs'    => "␜",
+		'ofs'    => "␜",
+
+		're'     => '',
+
+		'cols'   => [],
+		'prints' => [],
+
+		'dates'  => {},
+
+		'begin'  => "1970-01-01",
+		'end'    => "3000-01-01",
+
+		'ipdbfn' => "/etc/ip2location.csv",
+		'ipdb'   => [],
+
+		'joins'  => {},
+		'melts'  => {},
+		'skips'  => undef,
+		'iplocs' => {},
+		'ips'     => [],
+
+		'fns'    => [],
+
+		'strict' => 0,
+	};
+
+	# Column separator; column name are convenience, user
+	# should always be able to choose them so as to avoid
+	# coma.
+	my $csep = ',';
+
+	# Parameter separator, used to separate melt/join sub
+	# parameters.
+	my $psep = " ";
+
+	my $errs  = [];
+	my $err   = undef;
+	my $skips = [];
+
+	Getopt::Long::GetOptionsFromArray(
+		$argv,
+		'help|h'      => sub {
+			print "analogtweak [-i ifs] [-o ofs] -c cols -p prints\n";
+			exit(0);
+		},
+		'ifs|i=s'     => \$S->{'ifs'},
+		'ofs|o=s'     => \$S->{'ofs'},
+		'cols|c=s'    => sub { push(@{$S->{'cols'}},   split($csep, $_[1], -1)); },
+		'prints|p=s'  => sub { push(@{$S->{'prints'}}, split($csep, $_[1], -1)); },
+		'ipdbfn|f=s'  => \$S->{'ipdbfn'},
+		'skip|s=s'    => sub { push(@$skips, $_[1]); },
+		'join|j=s'    => sub {
+			my ($to, $fs, $sep) = split($psep, $_[1], 3);
+			my @fs = split($csep, $fs, -1);
+			if (!defined($to) || scalar(@fs) == 0) {
+				push(@$errs, "--joins 'to fs0,...,fsn[ sep]'");
+				return;
+			}
+			$S->{'joins'}{$to} = [[@fs], $sep || " "];
+		},
+		'melt|m=s'    => sub {
+			my ($f, $fs, $r) = split($psep, $_[1], 3);
+			my ($re, $err) = @{regcomp($r)};
+			push(@$errs, $err) if ($err);
+			$S->{'melts'}{$f} = [[split($csep, $fs)], $re];
+		},
+		'date|d=s' => sub {
+			my ($d, $e, $f) = split($csep, $_[1], 3);
+			$S->{'dates'}{$d} = [$e, $f];
+		},
+		'begin|b=s'   => \$S->{'begin'},
+		'end|e=s'     => \$S->{'end'},
+		'iploc|l=s'   => sub {
+			my ($x, $y) = split($csep, $_[1]);
+			$S->{'iplocs'}{$x} = $y;
+		},
+		'regex|r=s'   => sub {
+			($S->{'re'}, $err) = @{regcomp($_[1])};
+			push(@$errs, $err) if ($err);
+		},
+		'ips|e=s'      => sub {
+			$S->{'ips'} = [split($csep, $_[1], -1)];
+		},
+
+		'strict'       => \$S->{'strict'},
+
+		# Automatic mode for parsing OpenBSD's httpd(8) logs
+		# in forwarded format
+		#
+		# Kept for the tests; use --openbsd-httpd-fw instead
+		'openbsd-httpd-fw-qs' => sub {
+			$S->{'cols'} = [
+				"domain", "ip", "", "", "date", "request", "status",
+				"size", "", "agent", "fw-ip", "",
+			];
+			$S->{'prints'} = [qw(
+				domain  date    timestamp method path status
+				version country real-ip   values agent
+			)];
+			$S->{'dates'}{'timestamp'} = ["date", "%d/%b/%Y:%T %z"];
+
+			$S->{'ips'}               = ["real-ip", "ip", "fw-ip"];
+			$S->{'iplocs'}{'country'} = "real-ip";
+
+			# "GET /remote/fgt_lang?lang=/../../../..//////////dev/ HTTP/1.1"
+			$S->{'melts'}{'request'} = [
+				[qw(method path values version)],
+				qr/^(\w+) ([^ \?]+)(\?[^ ]*|) (.*)$/,
+			];
+
+			push(@$skips, '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}.\d*Z␜.*␜logfile.*turned.*over$');
+		},
+
+		'openbsd-httpd-fw' => sub {
+			# Write-only I guess; tests work from interesting enough samples.
+			$S->{'re'} = httpdfwre();
+
+			$S->{'cols'} = [
+				"domain", "ip", "", "", "date", "method", "path",
+				"values", "version", "status", "size", "", "agent",
+				"fw-ip", "",
+			];
+			$S->{'prints'} = [qw(
+				domain  date    timestamp method path status
+				version country real-ip   values agent
+			)];
+			$S->{'dates'}{'timestamp'} = ["date", "%d/%b/%Y:%T %z"];
+
+			$S->{'ips'}               = ["real-ip", "ip", "fw-ip"];
+			$S->{'iplocs'}{'country'} = "real-ip";
+
+			push(@$skips, '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}.\d*Z .* logfile turned over$');
+		},
+
+		'openbsd-auth-iso' => sub {
+			# Write-only I guess; tests work from interesting enough samples.
+			$S->{'re'} = authlogre();
+
+			$S->{'cols'} = [qw(date user ip)];
+			$S->{'prints'} = [qw(
+				date timestamp user ip country
+			)];
+			$S->{'dates'}{'timestamp'} = ["date", "%Y-%m-%dT%H:%M:%S.%fZ"];
+			$S->{'iplocs'}{'country'} = "ip";
+
+			push(@$skips,
+				'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}.\d*Z .* logfile turned over$',
+				# Non-ISO date entries, e.g.
+				# Jul  8 05:17:40 main sshd[1]: Connection closed by 8.8.8.8 port 1 [preauth]
+				'^[^0-9]',
+			);
+		},
+	);
+
+	return [undef, join(", ", @$errs)] if (scalar(@$errs));
+
+	# Remaining arguments if any are input files
+	push(@{$S->{'fns'}}, @$argv);
+
+	# Read from stdin by default
+	if (scalar(@{$S->{'fns'}}) == 0) {
+		push(@{$S->{'fns'}}, "/dev/stdin");
+	}
+
+	# Try parsing begin/end dates
+	($S->{'begin'}, $err) = @{date2ts("$S->{'begin'} 00:00:00")};
+	return [undef, $err] if (defined($err));
+
+	($S->{'end'}, $err)   = @{date2ts("$S->{'end'} 23:59:59")};
+	return [undef, $err] if (defined($err));
+
+	# Merge all skips in one regexp
+	if (scalar(@$skips)) {
+		# TODO: qr/$S->{'skips'}/ ?
+		$S->{'skips'} = '('.join('|', @$skips).')';
+	}
+
+	# Try loading the IP2LOCATION database
+	($S->{'ipdb'}, $err) = @{parseipdb($S->{'ipdbfn'})};
+	return defined($err) ?  [undef, $err] : [$S, undef];
+}
+
+
+# Try parsing a line of a IP2LOCATION-LITE-DB1 (IPv4) file,
+#
+# Sample lines:
+#	"0","16777215","-","-"
+#	"16777216","16777471","US","United States of America"
+#	"16777472","16778239","CN","China"
+#	"16778240","16779263","AU","Australia"
+#	"86155264","86157311","PS","Palestine, State of"
+#
+# We can also read IP2LOCATION-LITE-DB11.CSV file, unused
+# fields are ignored:
+#	"0","16777215","-","-","-","-","0.000000","0.000000","-","-"
+#	"16777216","16777471","US","United States of America","California","Los Angeles","34.052230","-118.243680","90001","-07:00"
+#	"16777472","16778239","CN","China","Fujian","Fuzhou","26.061390","119.306110","350004","+08:00"
+#	"16778240","16779263","AU","Australia","Victoria","Melbourne","-37.814000","144.963320","3000","+10:00"
+#	"16779264","16781311","CN","China","Guangdong","Guangzhou","23.116670","113.250000","510140","+08:00"
+#
+# NOTE: we could use a more efficient data-structure; for
+# current use cases, this is good enough.
+#
+# Input:
+#	$ipdb : where to store parsed data
+#	$l    : raw CSV line to parse and store
+# Output:
+#	Arrayref [$ipdb, $error], with $error to undef
+#	if none.
+my $ipdbre = qr/^"([^"]+)","([^"]+)","([^"]+)","([^"]+)"/o;
+
+sub parseipdbline {
+	my ($ipdb, $l) = @_;
+
+	if ($l !~ /$ipdbre/o) {
+		return [undef, "Regex failed on: '$l'"];
+	}
+	my @xs = @{^CAPTURE};
+
+	# NOTE: We could swap instead
+	if ($xs[0] > $xs[1]) {
+		return [undef, "Bad range order: '$xs[0]' > '$xs[1]'"];
+	}
+
+	push(@$ipdb, {
+		'from'    => $xs[0],
+		'to'      => $xs[1],
+		'a2'      => $xs[2],
+		'country' => $xs[3],
+	});
+
+	return [$ipdb, undef];
+}
+
+sub parseipdb {
+	my ($fn) = @_;
+
+	my $ipdb = [];
+
+	open(my $fh, '<', $fn) or
+		return [undef, "$fn: cannot open for reading, $!"];
+
+	my $n = 1;
+	while (!eof($fh)) {
+		my $l = readline($fh);
+		if (!defined($l)) {
+			return [undef, "$fn:$n: read error: $!"]
+		}
+		my ($a, $err) = @{parseipdbline($ipdb, $l)};
+		if ($err) {
+			$err = "$fn:$n: $err";
+			return [undef, $err];
+		}
+		$n++;
+	}
+
+	close($fh);
+
+	return [$ipdb, undef];
+}
+sub locateipnum {
+	my ($ipdb, $n) = @_;
+
+	foreach my $x (@$ipdb) {
+		return $x->{'country'} if ($n >= $x->{'from'} && $n <= $x->{'to'});
+	}
+
+	return "Unknown";
+}
+
+sub ipv4tonum {
+	my ($ip) = @_;
+	if ($ip !~ /^([0-9]+)\.([0-9]+)\.([0-9]+)\.([0-9]+)$/) {
+		return [0, "Not an IPv4: '$ip'"],
+	}
+	my @x = @{^CAPTURE};
+	return [($x[3]<<0) | ($x[2]<<8) | ($x[1]<<16) | ($x[0]<<24), undef]
+}
+
+# ipv4tonum^-1
+#
+# Input:
+# Output:
+sub numtoipv4 {
+	my ($n) = @_;
+
+	return   (($n & 0xFF000000) >> 24)
+		.".".(($n & 0x00FF0000) >> 16)
+		.".".(($n & 0x0000FF00) >>  8)
+		.".".(($n & 0x000000FF) >>  0);
+}
+
+sub locateip {
+	my ($ipdb, $ip) = @_;
+	my ($n, $err) = @{ipv4tonum($ip)};
+	return $err ? [undef, $err] : [locateipnum($ipdb, $n), undef];
+}
+
+sub parsecols {
+	my ($l, $ifs, $names, $re) = @_;
+
+	# Split input line
+	my @fs = ();
+	if ($re) {
+		if ($l !~ $re) {
+			return [undef, "Regexp failed on: $l"];
+		}
+		@fs = map { $_ // '' } @{^CAPTURE};
+	} else {
+		@fs = split($ifs, $l, -1);
+		if ((my $n = scalar(@fs)) != (my $m = scalar(@$names))) {
+			return [undef, "Wrong number of column (got $n != $m): $l"];
+		}
+	}
+
+	# Load columns in hash indexed by column names
+	my $cols = {}; @{$cols}{@$names} = @fs;
+
+	# NOTE: we could remove it, for now, this contains the value
+	# of the last ignored column.
+#	delete($cols->{''});
+
+	return [$cols, undef];
+}
+
+# TODO: not individually tested
+sub meltfields {
+	my ($cols, $melts) = @_;
+
+	foreach my $f (keys(%$melts)) {
+		# Shortcut
+		my ($fs, $r) = @{$melts->{$f}};
+
+		if ($cols->{$f} =~ $r) {
+			@{$cols}{@$fs} = @{^CAPTURE};
+		} else {
+			@{$cols}{@$fs} = ("") x scalar(@$fs);
+		}
+	}
+
+	return $cols;
+}
+
+sub joinfields {
+	my ($cols, $joins) = @_;
+
+	foreach my $f (keys(%$joins)) {
+		# Shortcut
+		my ($fs, $sep) = @{$joins->{$f}};
+		$cols->{$f} = join($sep, @{$cols}{@$fs});
+	}
+
+	return $cols;
+}
+
+# TODO: not individually tested
+sub filterdates {
+	my ($cols, $dates, $begin, $end) = @_;
+
+	my $err = undef;
+
+	foreach my $d (keys(%$dates)) {
+		# Shortcut
+		my $f = $dates->{$d};
+
+		($cols->{$d}, $err) = @{date2ts($cols->{$f->[0]}, $f->[1])};
+		return [undef, $err] if defined($err);
+
+		# Shortcut
+		my $x = $cols->{$d};
+
+		# Not on time interval, skip
+		# TODO: use Time::Piece to compare dates?
+		return [undef, undef] if ($x < $begin || $x > $end);
+	}
+
+	return [$cols, undef];
+}
+
+# TODO: not individually tested
+sub locateips {
+	my ($cols, $iplocs, $ipdb) = @_;
+
+	foreach my $x (keys(%$iplocs)) {
+		$cols->{$x} = "Unknown";
+		my $ip = $iplocs->{$x};
+		if (exists($cols->{$ip}) && isrealip($cols->{$ip})) {
+			my ($y, $err) = @{locateip($ipdb, $cols->{$ip})};
+			return [undef, $err] if (defined($err));
+			$cols->{$x} = $y;
+			# Pick first non-"Unknown"
+			last if ($y ne "Unknown");
+		};
+	}
+
+	return [$cols, undef];
+}
+
+sub isrealip {
+	my ($ip) = @_;
+	return $ip ne "127.0.0.1" && $ip ne "" && $ip ne "-" ? 1 : 0;
+}
+
+sub meltips {
+	my ($cols, $ips) = @_;
+
+	# NOTE: @{$cols}{@{$ips}[1..$#$ips]} creates
+	# undefined entries for missing fields in $cols
+	foreach my $ip (@{$ips}[1..$#$ips]) {
+		if (exists($cols->{$ip}) && isrealip($cols->{$ip})) {
+			$cols->{$ips->[0]} = $cols->{$ip};
+			last;
+		}
+	}
+
+	return $cols;
+}
+
+# Central function
+sub processline {
+	my ($S, $l) = @_;
+
+	return [undef, undef] if ($S->{'skips'} && $l =~ $S->{'skips'});
+
+	my ($cols, $err) = @{parsecols($l, @{$S}{qw(ifs cols re)})};
+	return [undef, $err] if (defined($err));
+
+	$cols = meltfields($cols, $S->{'melts'});
+	$cols = joinfields($cols, $S->{'joins'});
+
+	($cols, $err) = @{filterdates($cols, @{$S}{qw(dates begin end)})};
+	return [undef, $err] unless(defined($cols));
+
+	$cols = meltips($cols, $S->{'ips'});
+
+	($cols, $err) = @{locateips($cols, $S->{'iplocs'}, $S->{'ipdb'})};
+	return [undef, $err] if (defined($err));
+
+	# Extract relevant columns only
+	return [[@{$cols}{@{$S->{'prints'}}}], undef];
+}
+
+sub parseline {
+	my ($S, $l) = @_;
+
+	my ($xs, $err) = @{processline($S, $l)};
+	if (!defined($err) && defined($xs)) {
+		print join($S->{'ofs'}, @$xs)."\n";
+	}
+
+	return $err
+}
+
+sub slurp {
+	my ($fn) = @_;
+
+	my $fh;
+
+	open($fh, '<', $fn) or
+    	return [undef, "Failed to open '$fn': $!"];
+
+    local $/ = undef;
+    my $xs = <$fh> // return [undef, "$fn: read error: $!"];
+    close($fh);
+
+	return [$xs, undef];
+}
+
+sub parsefile {
+	my ($S, $fn, $parseline) = @_;
+
+	my ($xs, $err) = @{slurp($fn)};
+	return [$err] if($err);
+
+	my @ls = split("\n", $xs, -1);
+	my $errs = [];
+
+	my $n = 1;
+	foreach my $l (@ls) {
+		my $err = $parseline->($S, $l);
+		push(@$errs, "$fn:$n: $err") if ($err);
+		$n++;
+	}
+
+	return $errs;
+}
+
+sub parsefile2 {
+	my ($S, $fn, $parseline) = @_;
+
+	open(my $fh, "<", $fn) or
+		return ["$fn: cannot open for reading, $!"];
+
+	my $errs = [];
+
+	my $n = 1;
+	while (!eof($fh)) {
+		my $l = readline($fh);
+		if (!defined($l)) {
+			push(@$errs, "$fn:$n: read error: $!");
+			last;
+		}
+		chomp($l);
+		my $err = $parseline->($S, $l);
+		push(@$errs, "$fn:$n: $err") if ($err);
+		$n++;
+	}
+
+	close($fh);
+
+	return $errs;
+}
+sub parsefiles {
+	my ($S, $fns, $parseline) = @_;
+
+	if (scalar(@$fns) == 0) {
+		push(@$fns, "/dev/stdin");
+	}
+
+	my $errs = [];
+
+	foreach my $fn (@$fns) {
+		push(@$errs, @{parsefile($S, $fn, $parseline)});
+	}
+
+	return $errs;
+}
+
+sub mainparsefiles {
+	my ($argv, $parseopts, $parseline) = @_;
+
+	my ($S, $err) = @{$parseopts->($argv)};
+	die($err) if (defined($err));
+
+	my $errs = [];
+	if (scalar(@{$errs = parsefiles($S, $argv, $parseline)})) {
+		for my $err (@$errs) {
+			print STDERR "$err\n";
+		}
+		die("Failed!") if ($S->{'strict'});
+	}
+	exit(0);
+}
+
+mainparsefiles(\@ARGV, \&parseopts, \&parseline) unless(caller());
+
+1;

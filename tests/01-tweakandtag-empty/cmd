@@ -1,0 +1,14 @@
+#!/bin/sh
+
+set -e
+
+fn=`mktemp /tmp/test.XXXXXX`
+echo '[]' > $fn
+
+logtweak -openbsd-httpd-fw -ipdb /dev/null </dev/stdin | logtag -rules $fn
+x=$?
+
+rm $fn;exit $x
+
+
+

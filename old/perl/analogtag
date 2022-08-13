@@ -1,0 +1,245 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use JSON::PP;
+
+sub slurp {
+	my ($fn) = @_;
+
+	my $fh;
+
+	open($fh, '<', $fn) or
+    	return [undef, "Failed to open '$fn': $!"];
+
+    local $/ = undef;
+    my $xs = <$fh> // return [undef, "$fn: read error: $!"];
+    close($fh);
+
+	return [$xs, undef];
+}
+
+sub slurpjson {
+	my ($fn) = @_;
+
+	my ($x, $err) = @{slurp($fn)};
+	return [undef, $err] if ($err);
+
+	my $y = eval { JSON::PP::decode_json($x) };
+	return $@ ? [undef, "$fn: JSON parsing error: $@"] : [$y, undef];
+}
+
+# TODO: shared code
+sub regcomp {
+	my ($x) = @_;
+
+	my $y = eval {
+		use warnings FATAL => qw(regexp);
+		qr($x);
+	};
+
+	return $@ ? [undef, "cannot compile '$x': $@"] : [$y, undef];
+}
+
+# NOTE: we could split this in smaller subs
+sub checkandparserules {
+	my ($cols, $rs) = @_;
+
+	if (ref($rs) ne 'ARRAY') {
+		return [undef, "rules should be stored in an array"];
+	}
+
+	my $n = 1;
+	my $err = undef;
+	foreach my $r (@$rs) {
+		if (ref($r) ne 'HASH') {
+			return [undef, "rule $n: not in a hash"];
+		}
+
+		$r->{'exprs'}    //= {};
+		$r->{'tags'}     //= [];
+		$r->{'continue'} //= undef;
+
+		if ((my $x = ref($r->{'exprs'})) ne 'HASH') {
+			return [undef, "rule $n: exprs should be a hash, got '$x'"];
+		}
+		foreach my $f (keys(%{$r->{'exprs'}})) {
+			if (!exists($cols->{$f})) {
+				return [undef, "rule $n: unknown column in exprs: '$f'"];
+			}
+			if ((my $x = ref($r->{'exprs'}{$f})) ne '') {
+				return [undef, "rule $n: field '$f': string expected, got '$x'"],
+			}
+			($r->{'exprs'}{$f}, $err) = @{regcomp($r->{'exprs'}{$f})};
+			if (defined($err)) {
+				return [undef, "rule $n: exprs regex syntax for column '$f': $err"];
+			}
+		}
+
+		if ((my $x = ref($r->{'tags'})) ne 'ARRAY') {
+			return [undef, "rule $n: tags should be an array, got '$x'"];
+		}
+	}
+
+	return [$rs, undef];
+}
+
+# Parse options from ARGV, and create a state (hashref)
+# representing the application.
+#
+# TODO: have this return an array of error instead of a single
+# error.
+#
+# Input:
+#	$argv : arrayref, generally pointing to @ARGV or similar
+# Output:
+#	hashref representing application state
+sub parseopts {
+	my ($argv) = @_;
+
+	my $S = {
+		'ifs'    => '␜',
+		'ofs'    => '␜',
+		# name => index
+		'cols'   => {},
+		'ts'     => ',',
+		'rules'  => [],
+	};
+
+	# Column separator; column name are convenience, user
+	# should always be able to choose them so as to avoid
+	# coma.
+	my $csep = ',';
+
+	my $rs  = undef;
+	my $err = undef;
+
+	Getopt::Long::GetOptionsFromArray(
+		$argv,
+		'help|h'      => sub {
+			print "analogtag [-i ifs] [-o ofs] [-c cols] [\n";
+			exit(0);
+		},
+		'ifs|i=s'    => \$S->{'ifs'},
+		'ofs|o=s'    => \$S->{'ofs'},
+		'cols|c=s'   => sub {
+			my @cs = split($csep, $_[1], -1);
+			# @cs -> { $cs[0] => 0, $cs[1] => 2, ... };
+			@{$S->{'cols'}}{@cs} = 0..$#cs;
+		},
+		'tagsep|t=s' => \$S->{'ts'},
+		'rules|n=s'  => sub {
+			($rs, $err) = @{slurpjson($_[1])};
+		},
+	);
+
+	if (!defined($err)) {
+		($rs, $err) = @{checkandparserules($S->{'cols'}, $rs)};
+		push(@{$S->{'rules'}}, @$rs) unless(defined($err));
+	}
+
+	return [$S, $err];
+}
+
+sub tag {
+	my ($fs, $cols, $rs) = @_;
+
+	my $tags = [];
+
+	RULE: foreach my $r (@$rs) {
+		foreach my $f (keys(%{$r->{'exprs'}})) {
+			next RULE if ($fs->[$cols->{$f}] !~ $r->{'exprs'}{$f});
+		}
+		push(@$tags, @{$r->{'tags'}});
+		last unless($r->{'continue'});
+	}
+
+	return [sort(@$tags)];
+}
+
+sub processline {
+	my ($S, $l) = @_;
+
+	my @fs = split($S->{'ifs'}, $l, -1);
+
+	if ((my $n = scalar(@fs)) != (my $m = scalar(keys(%{$S->{'cols'}})))) {
+		return [undef, "Invalid number of fields: got $n, expect $m"];
+	}
+
+	return [[
+		@fs,
+		join($S->{'ts'}, @{tag(\@fs, $S->{'cols'}, $S->{'rules'})})
+	], undef];
+}
+
+sub parseline {
+	my ($S, $l) = @_;
+	my ($fs, $err) = @{processline($S, $l)};
+	return $err if (defined($err));
+	print join($S->{'ofs'}, @$fs)."\n";
+	return undef;
+}
+
+sub parsefile {
+	my ($S, $fn, $parseline) = @_;
+
+	open(my $fh, "<", $fn) or
+		return ["$fn: cannot open for reading, $!"];
+
+	my $errs = [];
+
+	my $n = 1;
+	while (!eof($fh)) {
+		my $l = readline($fh);
+		if (!defined($l)) {
+			push(@$errs, "$fn:$n: read error: $!");
+			last;
+		}
+		chomp($l);
+		my $err = $parseline->($S, $l);
+		push(@$errs, "$fn:$n: $err") if ($err);
+		$n++;
+	}
+
+	close($fh);
+
+	return $errs;
+}
+
+sub parsefiles {
+	my ($S, $fns, $parseline) = @_;
+
+	if (scalar(@$fns) == 0) {
+		push(@$fns, "/dev/stdin");
+	}
+
+	my $errs = [];
+
+	foreach my $fn (@$fns) {
+		push(@$errs, @{parsefile($S, $fn, $parseline)});
+	}
+
+	return $errs;
+}
+
+sub mainparsefiles {
+	my ($argv, $parseopts, $parseline) = @_;
+
+	my ($S, $err) = @{$parseopts->($argv)};
+	die($err) if (defined($err));
+
+	my $errs = [];
+	if (scalar(@{$errs = parsefiles($S, $argv, $parseline)})) {
+		for my $err (@$errs) {
+			print STDERR "$err\n";
+		}
+		die("Failed!")
+	}
+	exit(0);
+}
+
+mainparsefiles(\@ARGV, \&parseopts, \&parseline) unless(caller());
+
+1;

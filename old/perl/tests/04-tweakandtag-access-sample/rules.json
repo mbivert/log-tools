@@ -1,0 +1,88 @@
+[
+	{
+		"exprs" : {
+			"agent" : "Googlebot"
+		},
+		"tags" : ["googlebot"],
+		"continue" : 1
+	},
+	{
+		"exprs" : {
+			"agent" : "bingbot"
+		},
+		"tags" : ["bingbot"],
+		"continue" : 1
+	},
+	{
+		"exprs" : {
+			"domain" : "^www.zhongmu.eu$",
+			"status" : "^3"
+		},
+		"tags" : ["301:zm:ok"]
+	},
+	{
+		"exprs" : {
+			"domain" : "^www.zhongmu.eu$",
+			"status" : "^[12]"
+		},
+		"tags" : ["301:zm:ko"]
+	},
+	{
+		"exprs" : {
+			"domain" : "^tales.mbivert.com$",
+			"path"   : "^/(fr/|en/|)([^/]+/|)$",
+			"status" : "^[123]"
+		},
+		"tags" : ["tales"]
+	},
+	{
+		"exprs" : {
+			"domain" : "^tales.mbivert.com$",
+			"status" : "^[123]"
+		},
+		"tags"     : ["tales:others"]
+	},
+	{
+		"exprs" : {
+			"domain" : "^mbivert.com$",
+			"status" : "^3"
+		},
+		"tags" : ["301:mb:ok"]
+	},
+	{
+		"exprs" : {
+			"domain" : "^mbivert.com$",
+			"path"   : "^/(fr/|en/|)([^/]+/|)$",
+			"status" : "^[12]"
+		},
+		"tags" : ["mbivert"]
+	},
+	{
+		"exprs" : {
+			"domain" : "^mbivert.com$",
+			"status" : "^[123]"
+		},
+		"tags" : ["mbivert:others"]
+	},
+	{
+		"exprs" : {
+			"path"   : "^/favicon.ico$",
+			"status" : "^[45]"
+		},
+		"tags"   : ["TODO"]
+	},
+	{
+		"exprs" : {
+			"path"   : ".*",
+			"status" : "^[345]"
+		},
+		"tags"   : ["hack:ko"]
+	},
+	{
+		"exprs" : {
+			"path"   : ".*",
+			"status" : "^[12]"
+		},
+		"tags"   : ["hack:ok"]
+	}
+]
